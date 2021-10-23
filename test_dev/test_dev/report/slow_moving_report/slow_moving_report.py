@@ -1,21 +1,16 @@
 
 from __future__ import unicode_literals
 import frappe
-from frappe import _, scrub
-from frappe.utils import getdate, flt
-from erpnext.stock.report.stock_balance.stock_balance import (get_items, get_stock_ledger_entries, get_item_details)
-from erpnext.accounts.utils import get_fiscal_year
-from erpnext.stock.utils import is_reposting_item_valuation_in_progress
-from six import iteritems
+from frappe import _
+from frappe.utils import getdate, add_months, format_date, get_last_day,format_date
+from dateutil.relativedelta import relativedelta
 
 def execute(filters=None):
-	is_reposting_item_valuation_in_progress()
 	filters = frappe._dict(filters or {})
-	columns = get_columns(filters)
-	data = get_data(filters)
-	chart = get_chart_data(columns)
+	columns, query = get_columns(filters)
+	data = get_data(filters, query)
 
-	return columns, data, None, chart
+	return columns, data
 
 def get_columns(filters):
 	columns = [
@@ -53,130 +48,67 @@ def get_columns(filters):
 			"width": 120
 		}]
 
-	ranges = get_period_date_ranges(filters)
-
-	for dummy, end_date in ranges:
-		period = get_period(end_date, filters)
-
-		columns.append({
-			"label": _(period),
-			"fieldname":scrub(period),
-			"fieldtype": "Float",
-			"width": 120
-		})
-
-	return columns
+	temp_columns, query = get_period_date_ranges(filters)
+	columns = columns + temp_columns
+	return columns, query
 
 def get_period_date_ranges(filters):
-		from dateutil.relativedelta import relativedelta
-		from_date, to_date = getdate(filters.from_date), getdate(filters.to_date)
+	from_date, to_date = getdate(filters.from_date), getdate(filters.to_date)
+	r = relativedelta(to_date,from_date)
+	months_difference = (r.years * 12) + r.months + 1
+	columns = []
+	query = ""
 
-		increment = {
-			"Monthly": 1,
-			"Quarterly": 3,
-			"Half-Yearly": 6,
-			"Yearly": 12
-		}.get(filters.range,1)
+	for i in range(months_difference):
+		date1 = get_last_day(add_months(from_date, i))
+		date2 = format_date(date1,"MMM-YYYY")
 
-		periodic_daterange = []
-		for dummy in range(1, 53, increment):
-			if filters.range == "Weekly":
-				period_end_date = from_date + relativedelta(days=6)
-			else:
-				period_end_date = from_date + relativedelta(months=increment, days=-1)
+		str1 = "sum(case when sle.posting_date <= '{0}' then actual_qty else 0 end)".format(date1)
+		str2 = "ABS(sum(case when DATE_FORMAT(sle.posting_date,'%%b-%%Y') = '{0}' and sle.voucher_type = 'Sales Invoice' then actual_qty else 0 end))".format(date2)
 
-			if period_end_date > to_date:
-				period_end_date = to_date
-			periodic_daterange.append([from_date, period_end_date])
+		query += " , {0} '{2} Balance', {1} '{2} Sale', ABS(({1}/{0})*100) '{2} Selling'".format(str1, str2 , date2)
 
-			from_date = period_end_date + relativedelta(days=1)
-			if period_end_date == to_date:
-				break
+		columns.append({"label": _("{0} Balance".format(date1)), "fieldtype": "Float","width": 80})
+		columns.append({"label": _("{0} Sale".format(date2)), "fieldtype": "Float","width": 80})
+		columns.append({"label": _("{0} Sale %".format(date2)), "fieldtype": "Percent","width": 80})
+		
+	return columns, query
+def get_conditions(filters={}):
+	conditions = " sle.company = %(company)s "
 
-		return periodic_daterange
-
-def get_period(posting_date, filters):
-	months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-	if filters.range == 'Weekly':
-		period = "Week " + str(posting_date.isocalendar()[1]) + " " + str(posting_date.year)
-	elif filters.range == 'Monthly':
-		period = str(months[posting_date.month - 1]) + " " + str(posting_date.year)
-	elif filters.range == 'Quarterly':
-		period = "Quarter " + str(((posting_date.month-1)//3)+1) +" " + str(posting_date.year)
-	else:
-		year = get_fiscal_year(posting_date, company=filters.company)
-		period = str(year[2])
-
-	return period
+	if filters.get("item_code"): 	conditions += " and sle.item_code = %(item_code)s "
+	if filters.get("warehouse"): 	conditions += " and sle.warehouse >= %(warehouse)s "
+	if filters.get("to_date"): 		conditions += " and sle.posting_date <= %(to_date)s "
+	
+	return conditions
 
 
-def get_periodic_data(entry, filters):
-	periodic_data = {}
-	for d in entry:
-		period = get_period(d.posting_date, filters)
-		bal_qty = 0
+def get_data(filters, query):
+	condition = get_conditions(filters)
 
-		if d.voucher_type == "Stock Reconciliation":
-			if periodic_data.get(d.item_code):
-				bal_qty = periodic_data[d.item_code]["balance"]
+	result = frappe.db.sql("""
+		SELECT 
+			i.item_code,
+			i.item_name,
+			i.item_group
+			%s
+		FROM
+			`tabItem` i
+		LEFT JOIN
+			`tabStock Ledger Entry` sle ON i.item_code = sle.item_code
+		WHERE
+			%s
+		GROUP BY i.item_code
 
-			qty_diff = d.qty_after_transaction - bal_qty
-		else:
-			qty_diff = d.actual_qty
+	""" % (query, condition),
+		{
+			"company":	filters.get("company"),
+			"item_code":filters.get("item_code"),
+			"warehouse":filters.get("warehouse"),
+			"to_date":	filters.get("to_date")
+		}, debug=True)
 
-		if filters["value_quantity"] == 'Quantity':
-			value = qty_diff
-		else:
-			value = d.stock_value_difference
-
-		periodic_data.setdefault(d.item_code, {}).setdefault(period, 0.0)
-		periodic_data.setdefault(d.item_code, {}).setdefault("balance", 0.0)
-
-		periodic_data[d.item_code]["balance"] += value
-		periodic_data[d.item_code][period] = periodic_data[d.item_code]["balance"]
-
-
-	return periodic_data
-
-def get_data(filters):
-	data = []
-	items = get_items(filters)
-	sle = get_stock_ledger_entries(filters, items)
-	item_details = get_item_details(items, sle, filters)
-	periodic_data = get_periodic_data(sle, filters)
-	ranges = get_period_date_ranges(filters)
-
-	for dummy, item_data in iteritems(item_details):
-		row = {
-			"name": item_data.name,
-			"item_name": item_data.item_name,
-			"item_group": item_data.item_group,
-			"uom": item_data.stock_uom,
-			"brand": item_data.brand,
-		}
-		total = 0
-		for dummy, end_date in ranges:
-			period = get_period(end_date, filters)
-			amount = flt(periodic_data.get(item_data.name, {}).get(period))
-			row[scrub(period)] = amount
-			total += amount
-		row["total"] = total
-		data.append(row)
-
-	return data
-
-def get_chart_data(columns):
-	labels = [d.get("label") for d in columns[5:]]
-	chart = {
-		"data": {
-			'labels': labels,
-			'datasets':[]
-		}
-	}
-	chart["type"] = "line"
-
-	return chart
+	return result
 
 
 
